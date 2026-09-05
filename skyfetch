@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""skyfetch: dependency-free terminal weather. Python 3.8+."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = '1.2.3'
+# ASCII-only silhouettes; moon is a night symbol, not a lunar-phase forecast.
+ART = {
+    'sunny': (33, ['         |', '    \\         /', '      .-"""-.', '     /       \\', ' -- |         | --', '     \\       /', "      '-...-'", '    /         \\', '         |']),
+    'night': (36, ['    *       .---.', "          .' .-'     +", '         /  /', '        |  |', '        |  |', '         \\  \\ ', "     +    '. '-.__.'", "            '-----'  *"]),
+    'cloudy': (37, ['          .----.', '     .---(      ).', '   .(            ).', '  (                )', "   '--------------'"]),
+    'partly-cloudy': (33, ['      \\  |  /', '       .---.', '   -- (     ) --', '      .----. \\', '  .--(      ).', ' (            )', "  '----------'"]),
+    'partly-cloudy-night': (36, ['    *    .-.', "       .' /     +", '      (  (', '       \\  \\   .--.', "        '._'-(    ).", '           (        )', "            '------'"]),
+    'rain': (34, ['          .----.', '     .---(      ).', '   .(            ).', '  (                )', "   '--------------'", '     /  /  /  /', '    /  /  /  /', '      /  /  /']),
+    'snow': (36, ['          .----.', '     .---(      ).', '   .(            ).', '  (                )', "   '--------------'", '     *   *   *', '       *   *', '     *   *   *']),
+    'storm': (35, ['          .----.', '     .---(      ).', '   .(            ).', '  (                )', "   '--------------'", '          / /', '         / /__', '        /___ /', '           / /', '          /_/']),
+    'fog': (37, ['        .----.', '    .--(      ).', '   (            )', "    '----------'", '  -----  -----  ---', '    -----  -----', '  ---  -----  -----']),
+    'unknown': (37, ['       ?????', '      ?     ?', '            ?', '          ??', '         ?', '', '         ?']),
+}
+
+class WeatherError(Exception):
+    pass
+
+def clean(value):
+    return ''.join(c for c in str(value) if c.isprintable())
+
+def state_dir(kind):
+    default = Path.home() / ('.config' if kind == 'CONFIG' else '.cache')
+    return Path(os.environ.get('XDG_' + kind + '_HOME', default)) / 'skyfetch'
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as f:
+            name = f.name
+            json.dump(data, f)
+        os.replace(name, path)
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
+
+def fetch(url, params):
+    request = urllib.request.Request(url + '?' + urllib.parse.urlencode(params),
+                                     headers={'User-Agent': 'skyfetch/' + VERSION})
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            data = json.load(response)
+        if not isinstance(data, dict) or data.get('error'):
+            raise WeatherError('Weather service returned an error.')
+        return data
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise WeatherError('Could not reach the weather service: ' + clean(exc)) from exc
+
+REGIONS = dict(pair.split(':') for pair in (
+    'AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|'
+    'FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|'
+    'LA:Louisiana|ME:Maine|MD:Maryland|MA:Massachusetts|MI:Michigan|MN:Minnesota|MS:Mississippi|'
+    'MO:Missouri|MT:Montana|NE:Nebraska|NV:Nevada|NH:New Hampshire|NJ:New Jersey|NM:New Mexico|'
+    'NY:New York|NC:North Carolina|ND:North Dakota|OH:Ohio|OK:Oklahoma|OR:Oregon|PA:Pennsylvania|'
+    'RI:Rhode Island|SC:South Carolina|SD:South Dakota|TN:Tennessee|TX:Texas|UT:Utah|VT:Vermont|'
+    'VA:Virginia|WA:Washington|WV:West Virginia|WI:Wisconsin|WY:Wyoming|DC:District of Columbia|'
+    'AB:Alberta|BC:British Columbia|MB:Manitoba|NB:New Brunswick|NL:Newfoundland and Labrador|'
+    'NS:Nova Scotia|NT:Northwest Territories|NU:Nunavut|ON:Ontario|PE:Prince Edward Island|'
+    'QC:Quebec|SK:Saskatchewan|YT:Yukon').split('|'))
+
+
+def locate(query, country=None, region=None):
+    parts = [part.strip() for part in query.split(',')]
+    if len(parts) > 3 or not all(parts):
+        raise WeatherError('Use City, State/Province, Country (or City, Country).')
+    if len(parts) == 3:
+        region, country = region or parts[1], country or parts[2]
+    elif len(parts) == 2:
+        if country:
+            region = region or parts[1]
+        else:
+            country = parts[1]
+    country = (country or '').strip()
+    country = {'uk': 'GB', 'usa': 'US', 'united states': 'US',
+               'united states of america': 'US', 'united kingdom': 'GB',
+               'canada': 'CA'}.get(country.casefold(), country)
+    region = (region or '').strip()
+    if country.upper() in ('US', 'CA'):
+        region = REGIONS.get(region.upper(), region)
+    params = {'name': parts[0], 'count': 100, 'language': 'en', 'format': 'json'}
+    if len(country) == 2:
+        params['countryCode'] = country.upper()
+    results = fetch('https://geocoding-api.open-meteo.com/v1/search', params).get('results', [])
+    if country:
+        results = [r for r in results if country.casefold() in
+                   (str(r.get('country', '')).casefold(), str(r.get('country_code', '')).casefold())]
+    if region:
+        results = [r for r in results if region.casefold() == str(r.get('admin1', '')).casefold()]
+    if not results:
+        raise WeatherError('No matching location. Check the city, full state/province name and country, or use --lat/--lon.')
+    return results
+
+
+def interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def choose_location(results, confirm=False):
+    if len(results) == 1 and not confirm:
+        return results[0]
+    if not interactive():
+        raise WeatherError('Ambiguous location. Specify City, State/Province, Country, or use --search and exact coordinates.')
+    print('\nMatching locations:')
+    for i, result in enumerate(results, 1):
+        print('  {}. {}{} ({}, {})'.format(i, label(result),
+              ' / ' + clean(result['admin2']) if result.get('admin2') else '',
+              result['latitude'], result['longitude']))
+    while True:
+        answer = input('Choose a number (q to cancel): ').strip()
+        if answer.lower() == 'q':
+            raise WeatherError('Setup cancelled; defaults were not changed.')
+        if answer.isdigit() and 1 <= int(answer) <= len(results):
+            return results[int(answer) - 1]
+        print('Enter a number from 1 to {}.'.format(len(results)))
+
+
+def setup(default_units):
+    if not interactive():
+        raise WeatherError('Run skyfetch in a terminal for first-run setup, or supply a location and --save.')
+    print('Welcome to skyfetch! Set your default location. (Ctrl-C to cancel)')
+    while True:
+        city = input('City: ').strip()
+        region = input('State / province (full name or US/Canada abbreviation; optional): ').strip()
+        country = input('Country (name or two-letter code): ').strip()
+        if not city or not country:
+            print('City and country are required. Please try again.')
+            continue
+        try:
+            location = choose_location(locate(city, country, region), confirm=True)
+            break
+        except WeatherError as exc:
+            if 'cancelled' in str(exc):
+                raise
+            print(clean(exc))
+            if input('Try again? [Y/n]: ').strip().lower() in ('n', 'no'):
+                raise WeatherError('Setup cancelled; defaults were not changed.')
+    while True:
+        units = input('Units [metric/imperial] ({}): '.format(default_units)).strip().lower() or default_units
+        units = {'m': 'metric', 'i': 'imperial'}.get(units, units)
+        if units in ('metric', 'imperial'):
+            return location, units
+        print('Enter metric or imperial.')
+
+
+def label(location):
+    return ', '.join(dict.fromkeys(clean(location[k]) for k in ('name', 'admin1', 'country') if location.get(k)))
+
+def condition(code, is_day=1):
+    if code == 0:
+        return ('sunny', 'Clear sky') if is_day else ('night', 'Clear night')
+    if code in (1, 2):
+        return ('partly-cloudy' if is_day else 'partly-cloudy-night'), ('Mostly clear' if code == 1 else 'Partly cloudy')
+    if code == 3: return 'cloudy', 'Overcast'
+    if code in (45, 48): return 'fog', 'Fog'
+    if code in (51, 53, 55): return 'rain', 'Drizzle'
+    if code in (56, 57, 66, 67): return 'rain', 'Freezing precipitation'
+    if code in (61, 63, 65, 80, 81, 82): return 'rain', 'Rain'
+    if code in (71, 73, 75, 77, 85, 86): return 'snow', 'Snow'
+    if code in (95, 96, 99): return 'storm', 'Thunderstorm' if code == 95 else 'Thunderstorm with hail'
+    return 'unknown', 'Unknown conditions'
+
+def validate(data):
+    if not isinstance(data, dict) or not isinstance(data.get('current'), dict):
+        raise WeatherError('Weather service returned incomplete data.')
+    if not isinstance(data['current'].get('weather_code'), (int, float)):
+        raise WeatherError('Weather service returned no current conditions.')
+    return data
+
+def weather(location, units, refresh):
+    params = {'latitude': location['latitude'], 'longitude': location['longitude'],
+              'current': 'temperature_2m,dew_point_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m',
+              'daily': 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
+              'forecast_days': 3, 'timezone': 'auto',
+              'temperature_unit': 'fahrenheit' if units == 'imperial' else 'celsius',
+              'wind_speed_unit': 'mph' if units == 'imperial' else 'kmh',
+              'precipitation_unit': 'inch' if units == 'imperial' else 'mm'}
+    key = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
+    path = state_dir('CACHE') / (key + '.json')
+    cache = read_json(path)
+    if isinstance(cache, dict):
+        try:
+            validate(cache['data'])
+            age = time.time() - float(cache['saved'])
+        except (KeyError, ValueError, TypeError, WeatherError):
+            cache = None
+    else:
+        cache = None
+    if cache and 0 <= age < 600 and not refresh:
+        return cache['data'], 'cached', age
+    try:
+        data = validate(fetch('https://api.open-meteo.com/v1/forecast', params))
+    except WeatherError:
+        if cache and 0 <= age < 86400:
+            return cache['data'], 'stale (offline)', age
+        raise
+    try:
+        write_json(path, {'saved': time.time(), 'data': data})
+    except OSError:
+        pass
+    return data, 'live', 0
+
+def number(value, suffix=''):
+    return '--' if value is None else '{}{}'.format(round(value, 1), suffix)
+
+def render(location, data, status, age, color, forecast=False, art_override=None):
+    current = data['current']
+    units = data.get('current_units', {})
+    art_key, description = condition(current['weather_code'], current.get('is_day', 1))
+    art_key = art_override or art_key
+    tint, art = ART[art_key]
+    def paint(s, code):
+        return '\033[{}m{}\033[0m'.format(code, s) if color else s
+    def unit(key):
+        return clean(units.get(key, '')).replace('°', ' deg ').replace('km/h', ' km/h').replace('mp/h', ' mph')
+    rows = [label(location), '-' * min(46, len(label(location))),
+            'Sky        ' + description,
+            'Temp       ' + number(current.get('temperature_2m'), unit('temperature_2m')),
+            'Feels like ' + number(current.get('apparent_temperature'), unit('apparent_temperature')),
+            'Dew point  ' + number(current.get('dew_point_2m'), unit('dew_point_2m')),
+            'Humidity   ' + number(current.get('relative_humidity_2m'), '%'),
+            'Wind       ' + number(current.get('wind_speed_10m'), unit('wind_speed_10m')),
+            'Precip     ' + number(current.get('precipitation'), ' ' + unit('precipitation')),
+            'Updated    ' + clean(current.get('time', '?')).replace('T', ' ') + ' ' + clean(data.get('timezone', '')),
+            'Source     Open-Meteo / ' + status + (' / {}m old'.format(int(age / 60)) if status in ('cached', 'stale (offline)') else '')]
+    if forecast:
+        daily = data.get('daily', {})
+        rows += ['', 'Next days (low / high; rain chance)']
+        for i, day in enumerate(daily.get('time', [])):
+            def item(key):
+                values = daily.get(key, [])
+                return values[i] if i < len(values) else None
+            rows.append('{}  {} / {}{}  {}  {}'.format(clean(day), number(item('temperature_2m_min')),
+                number(item('temperature_2m_max')), unit('temperature_2m'),
+                number(item('precipitation_probability_max'), '%'), condition(item('weather_code'))[1]))
+    width = max(map(len, art)) + 4
+    columns = shutil.get_terminal_size((100, 24)).columns
+    narrow = columns < width + max(map(len, rows)) + 2
+    print()
+    if narrow:
+        for line in art: print(paint('  ' + line, tint))
+        print()
+    for i in range(max(len(rows), 0 if narrow else len(art))):
+        left = '' if narrow else paint((art[i] if i < len(art) else '').ljust(width), tint)
+        right = rows[i] if i < len(rows) else ''
+        print('  ' + left + paint(right, '1;36' if i == 0 else '0'))
+    print()
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Neofetch-style weather. No API key or pip dependencies.',
+        epilog='Examples: skyfetch London --save | skyfetch --demo rain | skyfetch --forecast')
+    parser.add_argument('location', nargs='*', help='City or postal code, optionally followed by a comma and country/state')
+    parser.add_argument('--setup', action='store_true', help='Run location and units setup again')
+    parser.add_argument('--state', '--province', dest='region', help='State or province name (US/Canada abbreviations accepted)')
+    parser.add_argument('--country', help='Country name or two-letter code')
+    parser.add_argument('--lat', type=float)
+    parser.add_argument('--lon', type=float)
+    parser.add_argument('--search', action='store_true', help='List matching cities and coordinates')
+    parser.add_argument('--save', action='store_true', help='Save resolved location and units as defaults')
+    parser.add_argument('--units', choices=['metric', 'imperial'])
+    parser.add_argument('--forecast', action='store_true', help='Include three daily forecasts')
+    parser.add_argument('--refresh', action='store_true', help='Bypass the ten-minute cache')
+    parser.add_argument('--json', action='store_true', help='Print JSON for scripts')
+    parser.add_argument('--no-color', action='store_true')
+    parser.add_argument('--demo', choices=sorted(ART), help='Preview artwork with sample data, without network access')
+    parser.add_argument('--version', action='version', version='skyfetch ' + VERSION)
+    args = parser.parse_args(argv)
+    if (args.lat is None) != (args.lon is None): parser.error('--lat and --lon must be supplied together')
+    if args.lat is not None and not (-90 <= args.lat <= 90 and -180 <= args.lon <= 180): parser.error('Coordinates out of range')
+    if args.lat is not None and args.location: parser.error('Use a city OR coordinates')
+    if args.search and (not args.location or args.demo): parser.error('--search requires a city and cannot use --demo')
+    if args.save and args.demo: parser.error('--save cannot use demo data')
+    if args.setup and (args.location or args.lat is not None or args.demo or args.search or args.json):
+        parser.error('--setup cannot be combined with location, coordinates, demo, search or JSON')
+    config_path = state_dir('CONFIG') / 'config.json'
+    config = read_json(config_path)
+    config = config if isinstance(config, dict) else {}
+    units = args.units or config.get('units', 'metric')
+    if units not in ('metric', 'imperial'): units = 'metric'
+    try:
+        saved_location = config.get('location')
+        needs_setup = not isinstance(saved_location, dict) or not all(k in saved_location for k in ('latitude', 'longitude'))
+        run_setup = args.setup or (needs_setup and not args.location and args.lat is None and not args.demo)
+        if run_setup:
+            if args.json:
+                raise WeatherError('No saved location. Run skyfetch --setup in a terminal first.')
+            saved_location, units = setup(units)
+            write_json(config_path, {'location': saved_location, 'units': units})
+            print('Saved ' + label(saved_location) + '. Next time, just run skyfetch.\n')
+        if args.demo:
+            location = {'name': 'Skyfetch Demo', 'country': 'Sample data'}
+            code = {'sunny': 0, 'night': 0, 'partly-cloudy': 2, 'partly-cloudy-night': 2, 'cloudy': 3, 'rain': 63, 'snow': 73, 'storm': 95, 'fog': 45, 'unknown': -1}[args.demo]
+            data = {'current': {'weather_code': code, 'is_day': int(args.demo not in ('night', 'partly-cloudy-night')), 'temperature_2m': 68 if units == 'imperial' else 20,
+                    'dew_point_2m': 55.4 if units == 'imperial' else 13,
+                    'apparent_temperature': 66 if units == 'imperial' else 19, 'relative_humidity_2m': 64, 'wind_speed_10m': 8, 'precipitation': 0,
+                    'time': '2026-09-04T14:00'}, 'timezone': 'Demo/local',
+                    'current_units': {'dew_point_2m': '°F' if units == 'imperial' else '°C', 'temperature_2m': '°F' if units == 'imperial' else '°C', 'apparent_temperature': '°F' if units == 'imperial' else '°C', 'wind_speed_10m': ' mph' if units == 'imperial' else 'km/h', 'precipitation': 'inch' if units == 'imperial' else 'mm'}}
+            status, age = 'demo', 0
+        else:
+            if args.lat is not None:
+                location = {'name': '{:.4f}, {:.4f}'.format(args.lat, args.lon), 'latitude': args.lat, 'longitude': args.lon}
+            elif args.location:
+                results = locate(' '.join(args.location), args.country, args.region)
+                if args.search:
+                    for result in results:
+                        print('{}  --lat {} --lon {}'.format(label(result), result['latitude'], result['longitude']))
+                    return 0
+                location = choose_location(results)
+            else:
+                location = saved_location
+                if not isinstance(location, dict) or not all(k in location for k in ('latitude', 'longitude')):
+                    parser.error('Choose a city first: skyfetch "London, UK" --save')
+            data, status, age = weather(location, units, args.refresh)
+            if args.save:
+                write_json(config_path, {'location': location, 'units': units})
+        if args.json:
+            print(json.dumps({'location': location, 'status': status, 'cache_age_seconds': int(age), 'weather': data}, ensure_ascii=True))
+        else:
+            render(location, data, status, age, sys.stdout.isatty() and not args.no_color and 'NO_COLOR' not in os.environ and os.environ.get('TERM') != 'dumb', args.forecast, args.demo)
+        return 0
+    except EOFError:
+        print('skyfetch: Setup cancelled; input closed.', file=sys.stderr)
+        return 1
+    except (WeatherError, OSError, KeyError, TypeError, ValueError) as exc:
+        print('skyfetch: ' + clean(exc), file=sys.stderr)
+        return 1
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
