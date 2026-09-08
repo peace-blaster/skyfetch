@@ -64,7 +64,7 @@ Extract the new release and run `sh install.sh` from its `skyfetch` directory ag
 - If a refresh fails, a cache under 24 hours old is displayed with **stale (offline)** and its age. Older data is not used.
 - Cache age means time since download; the `Updated` field is the provider's weather timestamp.
 - To use the cache offline, run with saved defaults or the same coordinates. A city-name argument requires an online geocoding lookup.
-- Network requests time out after 12 seconds each. City lookup and forecast are separate requests.
+- Network requests time out after 12 seconds each. City lookup and forecast are separate requests. Interactive terminal runs show a small spinner while data is being fetched; redirected and JSON output stays clean.
 - JSON output includes location, live/cached/stale status, cache age, and provider weather data. Errors go to stderr; exit codes: 0 success, 1 service/file error, 2 invalid arguments, 130 interrupted.
 
 ## Data and terms

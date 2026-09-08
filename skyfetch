@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -68,6 +69,34 @@ def fetch(url, params):
     except (OSError, ValueError, urllib.error.URLError) as exc:
         raise WeatherError('Could not reach the weather service: ' + clean(exc)) from exc
 
+def process_with_spinner(action, message):
+    """Run a network action while showing progress in an interactive terminal."""
+    if not (sys.stdout.isatty() and sys.stderr.isatty()):
+        return action()
+    result, error = [], []
+
+    def work():
+        try:
+            result.append(action())
+        except BaseException as exc:
+            error.append(exc)
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    frames = '|/-\\'
+    i = 0
+    while worker.is_alive():
+        sys.stdout.write('\r{} {}'.format(message, frames[i % len(frames)]))
+        sys.stdout.flush()
+        i += 1
+        time.sleep(0.12)
+    worker.join()
+    sys.stdout.write('\r{}\r'.format(' ' * (len(message) + 2)))
+    sys.stdout.flush()
+    if error:
+        raise error[0]
+    return result[0]
+
 REGIONS = dict(pair.split(':') for pair in (
     'AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|'
     'FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|'
@@ -102,7 +131,9 @@ def locate(query, country=None, region=None):
     params = {'name': parts[0], 'count': 100, 'language': 'en', 'format': 'json'}
     if len(country) == 2:
         params['countryCode'] = country.upper()
-    results = fetch('https://geocoding-api.open-meteo.com/v1/search', params).get('results', [])
+    results = process_with_spinner(
+        lambda: fetch('https://geocoding-api.open-meteo.com/v1/search', params),
+        'Finding location').get('results', [])
     if country:
         results = [r for r in results if country.casefold() in
                    (str(r.get('country', '')).casefold(), str(r.get('country_code', '')).casefold())]
@@ -210,7 +241,9 @@ def weather(location, units, refresh):
     if cache and 0 <= age < 600 and not refresh:
         return cache['data'], 'cached', age
     try:
-        data = validate(fetch('https://api.open-meteo.com/v1/forecast', params))
+        data = validate(process_with_spinner(
+            lambda: fetch('https://api.open-meteo.com/v1/forecast', params),
+            'Fetching weather'))
     except WeatherError:
         if cache and 0 <= age < 86400:
             return cache['data'], 'stale (offline)', age
